@@ -62,6 +62,15 @@
               placeholder="可选：例如适用部门、版本、用途说明"
             ></el-input>
           </el-form-item>
+          <el-form-item label="AI 比对">
+            <el-switch
+              v-model="uploadForm.aiVerify"
+              inline-prompt
+              active-text="开启"
+              inactive-text="关闭"
+            />
+            <span class="ai-hint">默认关闭，开启后仅做差异提示，不影响入库结果</span>
+          </el-form-item>
         </el-form>
 
         <div class="actions">
@@ -128,6 +137,25 @@
           警告 {{ parseSummary.warningCount }} 条
         </el-tag>
       </div>
+      <div v-if="parseSummary.aiVerification.enabled" class="ai-verify-summary">
+        <el-tag :type="parseSummary.aiVerification.aiAvailable ? 'success' : 'warning'">
+          AI 可用：{{ parseSummary.aiVerification.aiAvailable ? '是' : '否' }}
+        </el-tag>
+        <el-tag type="info">字段差异 {{ parseSummary.aiVerification.fieldDiffCount }}</el-tag>
+        <el-tag type="info">表格差异 {{ parseSummary.aiVerification.tableDiffCount }}</el-tag>
+        <el-tag :type="parseSummary.aiVerification.comparisonLevel === 'consistent' ? 'success' : 'warning'">
+          比对级别：{{ parseSummary.aiVerification.comparisonLevel }}
+        </el-tag>
+      </div>
+      <el-alert
+        v-if="parseSummary.aiVerification.enabled && !parseSummary.aiVerification.aiAvailable"
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-top: 10px;"
+      >
+        AI 服务当前不可用，已自动降级为本地解析。
+      </el-alert>
       <div class="result-actions">
         <el-button type="primary" @click="goBack">返回模板列表</el-button>
         <el-button @click="resetForm">继续上传新模板</el-button>
@@ -147,12 +175,28 @@ const router = useRouter()
 const uploading = ref(false)
 const uploadRef = ref()
 const selectedFile = ref<File | null>(null)
-const parseSummary = ref<null | { fieldCount: number; tableCount: number; warningCount: number }>(null)
+type AiVerificationSummary = {
+  enabled: boolean
+  aiAvailable: boolean
+  fieldDiffCount: number
+  tableDiffCount: number
+  comparisonLevel: string
+}
+
+type ParseSummary = {
+  fieldCount: number
+  tableCount: number
+  warningCount: number
+  aiVerification: AiVerificationSummary
+}
+
+const parseSummary = ref<null | ParseSummary>(null)
 const guideExpanded = ref(false)
 
 const uploadForm = ref({
   name: '',
-  description: ''
+  description: '',
+  aiVerify: false
 })
 
 const goBack = () => {
@@ -160,7 +204,7 @@ const goBack = () => {
 }
 
 const resetForm = () => {
-  uploadForm.value = { name: '', description: '' }
+  uploadForm.value = { name: '', description: '', aiVerify: false }
   selectedFile.value = null
   parseSummary.value = null
   uploadRef.value?.clearFiles()
@@ -201,6 +245,8 @@ const submitUpload = async () => {
       formData.append('description', uploadForm.value.description)
     }
 
+    formData.append('aiVerify', String(uploadForm.value.aiVerify))
+
     const response = await axios.post('/api/templates', formData, {
       headers: {
         'Content-Type': 'multipart/form-data'
@@ -213,10 +259,19 @@ const submitUpload = async () => {
     }
 
     const parseResult = response.data.parseResult || { fields: [], tables: [], warnings: [] }
+    const aiVerification = response.data.aiVerification || {
+      enabled: uploadForm.value.aiVerify,
+      aiAvailable: false,
+      fieldDiffCount: 0,
+      tableDiffCount: 0,
+      comparisonLevel: uploadForm.value.aiVerify ? 'degraded' : 'disabled'
+    }
+
     parseSummary.value = {
       fieldCount: parseResult.fields?.length ?? 0,
       tableCount: parseResult.tables?.length ?? 0,
-      warningCount: parseResult.warnings?.length ?? 0
+      warningCount: parseResult.warnings?.length ?? 0,
+      aiVerification
     }
 
     ElMessage.success('上传成功，模板已解析')
@@ -427,6 +482,19 @@ const submitUpload = async () => {
 .actions :deep(.el-button),
 .result-actions :deep(.el-button) {
   min-width: 116px;
+}
+
+.ai-hint {
+  margin-left: 8px;
+  color: #909399;
+  font-size: 12px;
+}
+
+.ai-verify-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
 }
 
 @media (max-width: 1366px) {

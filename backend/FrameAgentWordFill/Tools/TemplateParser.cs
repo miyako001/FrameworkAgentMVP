@@ -11,18 +11,18 @@ namespace FrameAgentWordFill.Tools;
 public sealed class TemplateParser
 {
     private readonly ILogger<TemplateParser> _logger;
+    private readonly TemplatePlaceholderNormalizer _normalizer;
 
-    // 占位符正则表达式（支持标准格式和容错格式）
-    // 标准: {字段名}、{表格名.字段名}
-    // 容错: 【字段名】、［字段名］、{ 字段名 }
+    // 支持：{}、{{}}、[]、()，并兼容全角括号。
     private static readonly Regex PlaceholderRegex = new(
-        @"[\{【［]\s*([a-zA-Z0-9_\u4e00-\u9fa5]+(?:\.[a-zA-Z0-9_\u4e00-\u9fa5]+)?)\s*[\}】］]",
+        @"(\{\{\s*[^{}]+?\s*\}\}|\{\s*[^{}]+?\s*\}|\[\s*[^\[\]]+?\s*\]|\(\s*[^()]+?\s*\)|【\s*[^】]+?\s*】|［\s*[^］]+?\s*］)",
         RegexOptions.Compiled
     );
 
-    public TemplateParser(ILogger<TemplateParser> logger)
+    public TemplateParser(ILogger<TemplateParser> logger, TemplatePlaceholderNormalizer normalizer)
     {
         _logger = logger;
+        _normalizer = normalizer;
     }
 
     /// <summary>
@@ -80,6 +80,7 @@ public sealed class TemplateParser
     {
         var paragraphs = body.Elements<Paragraph>().ToList();
         var fieldNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var tableColumnKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         for (int i = 0; i < paragraphs.Count; i++)
         {
@@ -89,33 +90,24 @@ public sealed class TemplateParser
             if (string.IsNullOrWhiteSpace(text))
                 continue;
 
-            var matches = PlaceholderRegex.Matches(text);
-            foreach (Match match in matches)
+            var placeholders = NormalizePlaceholders(text, $"第 {i + 1} 段", result);
+            foreach (var placeholder in placeholders)
             {
-                var placeholder = match.Groups[1].Value.Trim();
-
-                // 跳过表格字段（包含点号）
                 if (placeholder.Contains('.'))
-                    continue;
-
-                // 规范化占位符（去除空格、转换全角符号）
-                var normalizedName = NormalizePlaceholder(placeholder, match.Value);
-                
-                // 检查是否需要规范化警告
-                if (match.Value != $"{{{normalizedName}}}")
                 {
-                    result.Warnings.Add($"第 {i + 1} 段：占位符 '{match.Value}' 已自动规范化为 '{{{normalizedName}}}'");
+                    AddTableFieldCandidate(placeholder, result, tableColumnKeys);
+                    continue;
                 }
 
                 // 去重
-                if (fieldNames.Contains(normalizedName))
+                if (fieldNames.Contains(placeholder))
                     continue;
 
-                fieldNames.Add(normalizedName);
+                fieldNames.Add(placeholder);
                 result.Fields.Add(new FieldInfo
                 {
-                    Name = normalizedName,
-                    Type = InferFieldType(normalizedName),
+                    Name = placeholder,
+                    Type = InferFieldType(placeholder),
                     Required = false,
                     Position = i
                 });
@@ -131,9 +123,11 @@ public sealed class TemplateParser
     private void ExtractFieldsFromTables(Body body, TemplateParseResult result)
     {
         var tables = body.Elements<Table>().ToList();
+        var tableColumnKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var table in tables)
+        for (int tableIndex = 0; tableIndex < tables.Count; tableIndex++)
         {
+            var table = tables[tableIndex];
             var rows = table.Elements<TableRow>().ToList();
             if (rows.Count == 0)
                 continue;
@@ -142,65 +136,26 @@ public sealed class TemplateParser
             var headerRow = rows[0];
             var headerCells = headerRow.Elements<TableCell>().ToList();
 
-            var tableInfo = new TableInfo();
-            var tableNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
             for (int colIndex = 0; colIndex < headerCells.Count; colIndex++)
             {
                 var cellText = GetCellText(headerCells[colIndex]);
-                var matches = PlaceholderRegex.Matches(cellText);
+                var placeholders = NormalizePlaceholders(cellText, $"第 {tableIndex + 1} 个表格第 {colIndex + 1} 列", result);
 
-                foreach (Match match in matches)
+                foreach (var placeholder in placeholders)
                 {
-                    var placeholder = match.Groups[1].Value.Trim();
-
-                    // 只处理表格字段（格式：表格名.字段名）
                     if (!placeholder.Contains('.'))
                         continue;
 
-                    var parts = placeholder.Split('.');
-                    if (parts.Length != 2)
-                    {
-                        result.Warnings.Add($"表格占位符格式错误: {match.Value}，应为 {{表格名.字段名}}");
-                        continue;
-                    }
-
-                    var tableName = parts[0].Trim();
-                    var columnName = parts[1].Trim();
-
-                    // 设置表格名称（第一次遇到时）
-                    if (string.IsNullOrEmpty(tableInfo.Name))
-                    {
-                        tableInfo.Name = tableName;
-                    }
-                    else if (tableInfo.Name != tableName)
-                    {
-                        result.Warnings.Add($"表格中发现不同的表格名: {tableName}，已忽略");
-                        continue;
-                    }
-
-                    // 避免重复列
-                    if (tableNames.Contains(columnName))
-                        continue;
-
-                    tableNames.Add(columnName);
-                    tableInfo.Columns.Add(new TableColumnInfo
-                    {
-                        Name = columnName,
-                        Type = InferFieldType(columnName),
-                        Required = false,
-                        Order = colIndex
-                    });
+                    AddTableFieldCandidate(placeholder, result, tableColumnKeys, colIndex);
                 }
             }
+        }
 
-            // 只添加有效的表格
-            if (!string.IsNullOrEmpty(tableInfo.Name) && tableInfo.Columns.Count > 0)
-            {
-                result.Tables.Add(tableInfo);
-                _logger.LogInformation("提取表格: {TableName}, 列数: {ColumnCount}", 
-                    tableInfo.Name, tableInfo.Columns.Count);
-            }
+        foreach (var tableInfo in result.Tables)
+        {
+            _logger.LogInformation("提取表格: {TableName}, 列数: {ColumnCount}",
+                tableInfo.Name,
+                tableInfo.Columns.Count);
         }
     }
 
@@ -221,22 +176,81 @@ public sealed class TemplateParser
     }
 
     /// <summary>
-    /// 规范化占位符（去除空格、转换全角符号）
+    /// 将文本中的占位符规范化为统一 token。
     /// </summary>
-    private static string NormalizePlaceholder(string placeholder, string originalText)
+    private List<string> NormalizePlaceholders(string text, string location, TemplateParseResult result)
     {
-        // 去除前后空格
-        var normalized = placeholder.Trim();
+        var output = new List<string>();
+        var matches = PlaceholderRegex.Matches(text);
 
-        // 替换全角符号（如果原文本包含全角括号）
-        if (originalText.Contains('【') || originalText.Contains('】') || 
-            originalText.Contains('［') || originalText.Contains('］'))
+        foreach (Match match in matches)
         {
-            normalized = normalized.Replace("【", "").Replace("】", "")
-                                   .Replace("［", "").Replace("］", "");
+            var raw = match.Value;
+            var normalized = _normalizer.Normalize(raw);
+            if (!normalized.Success)
+            {
+                if (!string.IsNullOrWhiteSpace(normalized.Error))
+                {
+                    result.Warnings.Add($"{location}：{normalized.Error}");
+                }
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(normalized.Warning))
+            {
+                result.Warnings.Add($"{location}：{normalized.Warning}");
+            }
+
+            output.Add(normalized.NormalizedToken);
         }
 
-        return normalized;
+        return output;
+    }
+
+    /// <summary>
+    /// 将点号字段加入表格候选（至少两段，例如 A.B 或 A.B.C）。
+    /// </summary>
+    private void AddTableFieldCandidate(
+        string normalizedToken,
+        TemplateParseResult result,
+        HashSet<string> tableColumnKeys,
+        int order = 0)
+    {
+        var parts = normalizedToken
+            .Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        if (parts.Length < 2)
+        {
+            result.Warnings.Add($"点号字段格式无效: {{{normalizedToken}}}，应至少包含两段");
+            return;
+        }
+
+        var tableName = parts[0];
+        var columnName = string.Join('.', parts.Skip(1));
+        var key = $"{tableName}.{columnName}";
+
+        if (!tableColumnKeys.Add(key))
+        {
+            return;
+        }
+
+        var table = result.Tables.FirstOrDefault(t => t.Name.Equals(tableName, StringComparison.OrdinalIgnoreCase));
+        if (table == null)
+        {
+            table = new TableInfo
+            {
+                Name = tableName
+            };
+            result.Tables.Add(table);
+        }
+
+        table.Columns.Add(new TableColumnInfo
+        {
+            Name = columnName,
+            Type = InferFieldType(columnName),
+            Required = false,
+            Order = table.Columns.Count > 0 ? table.Columns.Max(c => c.Order) + 1 : order
+        });
     }
 
     /// <summary>

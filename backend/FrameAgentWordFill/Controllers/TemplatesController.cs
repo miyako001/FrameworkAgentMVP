@@ -23,9 +23,14 @@ public class TemplatesController : ControllerBase
     /// <param name="file">模板文件</param>
     /// <param name="name">模板名称</param>
     /// <param name="description">描述</param>
+    /// <param name="aiVerify">是否启用 AI 双轨比对（默认 false）</param>
     /// <returns></returns>
     [HttpPost]
-    public async Task<IActionResult> UploadTemplate(IFormFile file, [FromForm] string name, [FromForm] string? description = null)
+    public async Task<IActionResult> UploadTemplate(
+        IFormFile file,
+        [FromForm] string name,
+        [FromForm] string? description = null,
+        [FromForm] bool aiVerify = false)
     {
         if (file == null || file.Length == 0)
         {
@@ -37,7 +42,8 @@ public class TemplatesController : ControllerBase
             return BadRequest(new { success = false, message = "请输入模板名称" });
         }
 
-        var (success, templateId, parseResult) = await _templateService.UploadTemplateAsync(file, name, description);
+        var (success, templateId, parseResult, aiVerification) =
+            await _templateService.UploadTemplateAsync(file, name, description, aiVerify);
 
         if (!success)
         {
@@ -45,7 +51,8 @@ public class TemplatesController : ControllerBase
             {
                 success = false,
                 message = "模板上传失败",
-                parseResult = parseResult
+                parseResult = parseResult,
+                aiVerification = aiVerification
             });
         }
 
@@ -54,7 +61,8 @@ public class TemplatesController : ControllerBase
             success = true,
             message = "模板上传成功",
             templateId = templateId,
-            parseResult = parseResult
+            parseResult = parseResult,
+            aiVerification = aiVerification
         });
     }
 

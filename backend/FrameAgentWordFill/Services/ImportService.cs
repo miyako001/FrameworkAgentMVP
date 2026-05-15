@@ -3,6 +3,10 @@ using FrameAgentWordFill.Models.AIExtraction;
 using FrameAgentWordFill.Repositories;
 using FrameAgentWordFill.Tools;
 using FrameAgentWordFill.Tools.FileParser;
+using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
+using Microsoft.Extensions.DependencyInjection;
+using System.Text.Json;
 
 namespace FrameAgentWordFill.Services;
 
@@ -23,6 +27,7 @@ public sealed class ImportService
     private readonly AIBatchExtractor _aiBatchExtractor;
     private readonly FieldMatcher _fieldMatcher;
     private readonly GenerateService _generateService;
+    private readonly AIAgent _importAgent;
     private readonly ILogger<ImportService> _logger;
 
     public ImportService(
@@ -38,6 +43,7 @@ public sealed class ImportService
         AIBatchExtractor aiBatchExtractor,
         FieldMatcher fieldMatcher,
         GenerateService generateService,
+        [FromKeyedServices("import")] AIAgent importAgent,
         ILogger<ImportService> logger)
     {
         _sessionRepository = sessionRepository;
@@ -52,6 +58,7 @@ public sealed class ImportService
         _aiBatchExtractor = aiBatchExtractor;
         _fieldMatcher = fieldMatcher;
         _generateService = generateService;
+        _importAgent = importAgent;
         _logger = logger;
     }
 
@@ -161,7 +168,7 @@ public sealed class ImportService
     }
 
     /// <summary>
-    /// W7: 使用 AI 批量提取并匹配字段。
+    /// W10: 使用 ImportAgent 批量提取并匹配字段（Agent 自主决策工具调用）。
     /// </summary>
     public async Task<(bool Success, string ErrorMessage)> ParseAndMatchFieldsWithAiAsync(int sessionId)
     {
@@ -182,13 +189,36 @@ public sealed class ImportService
             var fullPath = _fileStorage.GetUploadFilePath(session.FilePath);
             var parsedContent = await ParseDocumentContentAsync(session.FileType, fullPath);
 
-            var (aiFields, engineUsed) = await _aiBatchExtractor.ExtractFieldsAsync(parsedContent, template.Fields);
-            var mappings = _fieldMatcher.MatchAIExtractedFields(aiFields, template.Fields);
+            // W10: 尝试使用 ImportAgent 自主决策
+            List<ImportFieldMapping> mappings;
+            try
+            {
+                var documentContentJson = JsonSerializer.Serialize(parsedContent);
+                var templateFieldsJson = JsonSerializer.Serialize(template.Fields);
+                var prompt = $"文档内容：{documentContentJson}\n模板字段：{templateFieldsJson}";
+
+                var agentSession = await _importAgent.CreateSessionAsync();
+                var agentResponse = await _importAgent.RunAsync(
+                    new ChatMessage(ChatRole.User, prompt),
+                    agentSession,
+                    new AgentRunOptions(),
+                    default);
+
+                mappings = ParseImportAgentResult(agentResponse);
+                _logger.LogInformation("ImportAgent 提取完成：SessionId={SessionId}, Mappings={Count}",
+                    sessionId, mappings.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "ImportAgent 调用失败，降级到直接 Tool 调用。SessionId={SessionId}", sessionId);
+                var (aiFields, _) = await _aiBatchExtractor.ExtractFieldsAsync(parsedContent, template.Fields);
+                mappings = _fieldMatcher.MatchAIExtractedFields(aiFields, template.Fields);
+            }
 
             // AI 结果为空时，回退到原有规则解析路径，保证可用性。
             if (mappings.Count == 0)
             {
-                _logger.LogWarning("AI 提取结果为空，回退到规则解析。SessionId={SessionId}", sessionId);
+                _logger.LogWarning("提取结果为空，回退到规则解析。SessionId={SessionId}", sessionId);
                 return await ParseAndMatchFieldsAsync(sessionId);
             }
 
@@ -209,12 +239,8 @@ public sealed class ImportService
             await _sessionRepository.UpdateSessionStatusAsync(sessionId, "WaitingConfirm", matchedCount, unmatchedCount, warningText);
 
             _logger.LogInformation(
-                "AI 提取完成：SessionId={SessionId}, Engine={Engine}, Matched={Matched}, Unmatched={Unmatched}",
-                sessionId,
-                engineUsed,
-                matchedCount,
-                unmatchedCount
-            );
+                "AI 提取完成（W10）：SessionId={SessionId}, Matched={Matched}, Unmatched={Unmatched}",
+                sessionId, matchedCount, unmatchedCount);
 
             return (true, string.Empty);
         }
@@ -330,5 +356,32 @@ public sealed class ImportService
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// W10: 从 ImportAgent 响应中解析字段映射结果。
+    /// Agent 被要求以 JSON 数组形式返回映射，格式：
+    /// [{"sourceFieldName":"...","templateFieldName":"...","fieldValue":"...","matchConfidence":85,"matchMethod":"AI"}]
+    /// </summary>
+    private List<ImportFieldMapping> ParseImportAgentResult(AgentResponse agentResponse)
+    {
+        try
+        {
+            var text = agentResponse.Text ?? string.Empty;
+            var jsonStart = text.IndexOf("```json", StringComparison.OrdinalIgnoreCase);
+            if (jsonStart < 0) return new List<ImportFieldMapping>();
+            var contentStart = text.IndexOf('\n', jsonStart) + 1;
+            var jsonEnd = text.IndexOf("```", contentStart, StringComparison.OrdinalIgnoreCase);
+            if (jsonEnd <= contentStart) return new List<ImportFieldMapping>();
+            var jsonBlock = text[contentStart..jsonEnd].Trim();
+            var parsed = JsonSerializer.Deserialize<List<ImportFieldMapping>>(
+                jsonBlock,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            return parsed ?? new List<ImportFieldMapping>();
+        }
+        catch
+        {
+            return new List<ImportFieldMapping>();
+        }
     }
 }

@@ -1,6 +1,8 @@
 using FrameAgentWordFill.Data;
 using FrameAgentWordFill.Services;
 using FrameAgentWordFill.Tools;
+using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
 using Serilog;
 
 // 配置 Serilog
@@ -29,7 +31,10 @@ try
     
     // W2: 模板管理服务
     builder.Services.AddSingleton<FrameAgentWordFill.Repositories.TemplateRepository>();
+    builder.Services.AddSingleton<FrameAgentWordFill.Tools.TemplatePlaceholderNormalizer>();
     builder.Services.AddSingleton<FrameAgentWordFill.Tools.TemplateParser>();
+    builder.Services.AddSingleton<FrameAgentWordFill.Tools.TemplateAiParser>();
+    builder.Services.AddSingleton<FrameAgentWordFill.Tools.TemplateParseComparer>();
     builder.Services.AddSingleton<FrameAgentWordFill.Services.TemplateService>();
 
     // W3: 文档生成服务
@@ -54,6 +59,25 @@ try
     builder.Services.AddSingleton<FrameAgentWordFill.Tools.AIBatchExtractor>();
     builder.Services.AddSingleton<FrameAgentWordFill.Tools.FieldMatcher>();
     builder.Services.AddSingleton<FrameAgentWordFill.Services.ImportService>();
+
+    // W10: 标准化 LLM 接入层 + Agent 架构
+    builder.Services.AddSingleton<IChatClient, FallbackChatClient>();
+    builder.Services.AddSingleton<FrameAgentWordFill.Plugins.WordFillPlugin>();
+    builder.Services.AddSingleton<FrameAgentWordFill.Plugins.ImportPlugin>();
+    builder.Services.AddSingleton<AIAgent>(sp =>
+    {
+        var chatClient = sp.GetRequiredService<IChatClient>();
+        var plugin = sp.GetRequiredService<FrameAgentWordFill.Plugins.WordFillPlugin>();
+        var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+        return FrameAgentWordFill.Agents.WordFillAgentFactory.Create(chatClient, plugin, loggerFactory);
+    });
+    builder.Services.AddKeyedSingleton<AIAgent>("import", (sp, _) =>
+    {
+        var chatClient = sp.GetRequiredService<IChatClient>();
+        var plugin = sp.GetRequiredService<FrameAgentWordFill.Plugins.ImportPlugin>();
+        var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+        return FrameAgentWordFill.Agents.ImportAgentFactory.Create(chatClient, plugin, loggerFactory);
+    });
 
     // CORS（用于前端调用）
     builder.Services.AddCors(options =>

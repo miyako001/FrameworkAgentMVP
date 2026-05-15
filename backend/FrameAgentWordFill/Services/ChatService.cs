@@ -3,6 +3,10 @@ using FrameAgentWordFill.Models.Templates;
 using FrameAgentWordFill.Repositories;
 using FrameAgentWordFill.Tools;
 using FrameAgentWordFill.Agents;
+using Microsoft.Agents.AI;
+using AIChatMessage = Microsoft.Extensions.AI.ChatMessage;
+using AIChatRole = Microsoft.Extensions.AI.ChatRole;
+using System.Text.Json;
 
 namespace FrameAgentWordFill.Services;
 
@@ -15,6 +19,7 @@ public sealed class ChatService
     private readonly ChatSessionRepository _sessionRepository;
     private readonly AIFieldExtractor _fieldExtractor;
     private readonly DataValidator _dataValidator;
+    private readonly AIAgent _wordFillAgent;
     private readonly ILogger<ChatService> _logger;
 
     public ChatService(
@@ -22,12 +27,14 @@ public sealed class ChatService
         ChatSessionRepository sessionRepository,
         AIFieldExtractor fieldExtractor,
         DataValidator dataValidator,
+        AIAgent wordFillAgent,
         ILogger<ChatService> logger)
     {
         _templateRepository = templateRepository;
         _sessionRepository = sessionRepository;
         _fieldExtractor = fieldExtractor;
         _dataValidator = dataValidator;
+        _wordFillAgent = wordFillAgent;
         _logger = logger;
     }
 
@@ -109,15 +116,31 @@ public sealed class ChatService
                 return await HandleShortcutAsync(session, template, shortcut);
             }
 
-            // 3. 提取字段值
+            // 3. 提取字段值（W10: Agent 自主决策工具调用）
             var remainingFields = template.Fields
                 .Where(f => !session.CollectedFields.ContainsKey(f.Name))
                 .ToList();
 
-            var extractedFields = await _fieldExtractor.ExtractFieldsAsync(
-                userMessage,
-                remainingFields
-            );
+            Dictionary<string, string> extractedFields;
+            string agentGuideMessage = string.Empty;
+            try
+            {
+                var contextMessages = new List<AIChatMessage>
+                {
+                    new(AIChatRole.System, BuildFieldContextPrompt(template, session)),
+                    new(AIChatRole.User, userMessage)
+                };
+                var agentSession = await _wordFillAgent.CreateSessionAsync();
+                var agentResponse = await _wordFillAgent.RunAsync(
+                    contextMessages, agentSession, new AgentRunOptions(), default);
+                agentGuideMessage = agentResponse.Text ?? string.Empty;
+                extractedFields = ParseAgentFieldResult(agentResponse);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "WordFillAgent 调用失败，降级到直接 Tool 调用");
+                extractedFields = await _fieldExtractor.ExtractFieldsAsync(userMessage, remainingFields);
+            }
 
             // 4. 验证并保存字段
             var validationErrors = new List<string>();
@@ -152,8 +175,12 @@ public sealed class ChatService
                     sessionId, field.Name, kvp.Value);
             }
 
-            // 5. 生成下一步引导消息
-            var nextMessage = GenerateNextGuideMessage(session, template, validationErrors);
+            // 5. 生成下一步引导消息（优先使用 Agent 生成的消息）
+            var nextMessage = string.IsNullOrWhiteSpace(agentGuideMessage)
+                ? GenerateNextGuideMessage(session, template, validationErrors)
+                : (validationErrors.Count > 0
+                    ? $"抱歉，以下字段格式不正确：\n{string.Join("\n", validationErrors)}\n\n请重新输入。"
+                    : agentGuideMessage);
 
             // 6. 检查是否完成
             var isCompleted = CheckIfCompleted(session, template);
@@ -353,5 +380,53 @@ public sealed class ChatService
             return 1.0;
 
         return (double)session.CollectedFields.Count / template.Fields.Count;
+    }
+
+    /// <summary>
+    /// W10: 构建字段上下文 System Prompt，注入当前已收集与待收集字段状态
+    /// </summary>
+    private static string BuildFieldContextPrompt(Template template, ChatSession session)
+    {
+        var collected = session.CollectedFields
+            .Select(kvp => $"  - {kvp.Key}: {kvp.Value.Value}")
+            .ToList();
+        var remaining = template.Fields
+            .Where(f => !session.CollectedFields.ContainsKey(f.Name))
+            .Select(f => $"  - {f.Name}（{f.FieldType}，{(f.Required ? "必填" : "可选")}）")
+            .ToList();
+
+        var collectedText = collected.Count > 0
+            ? $"已收集字段：\n{string.Join("\n", collected)}"
+            : "已收集字段：（无）";
+        var remainingText = remaining.Count > 0
+            ? $"待收集字段：\n{string.Join("\n", remaining)}"
+            : "待收集字段：（全部完成）";
+
+        return $"模板名称：{template.Name}\n{collectedText}\n{remainingText}\n\n请根据用户消息，调用合适的工具提取字段值，并用中文友好地引导用户。最终请在回复末尾附上 JSON 块（格式：```json\n{{...}}\n```）列出本次提取到的字段，如无提取则附空对象 {{}}。";
+    }
+
+    /// <summary>
+    /// W10: 从 Agent 响应文本中解析提取到的字段值（期望格式：```json\n{{...}}\n```）
+    /// </summary>
+    private Dictionary<string, string> ParseAgentFieldResult(AgentResponse agentResponse)
+    {
+        try
+        {
+            var text = agentResponse.Text ?? string.Empty;
+            var jsonStart = text.IndexOf("```json", StringComparison.OrdinalIgnoreCase);
+            if (jsonStart < 0) return new Dictionary<string, string>();
+            var contentStart = text.IndexOf('\n', jsonStart) + 1;
+            var jsonEnd = text.IndexOf("```", contentStart, StringComparison.OrdinalIgnoreCase);
+            if (jsonEnd <= contentStart) return new Dictionary<string, string>();
+            var jsonBlock = text[contentStart..jsonEnd].Trim();
+            var parsed = JsonSerializer.Deserialize<Dictionary<string, string>>(
+                jsonBlock,
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            return parsed ?? new Dictionary<string, string>();
+        }
+        catch
+        {
+            return new Dictionary<string, string>();
+        }
     }
 }

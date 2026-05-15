@@ -13,35 +13,48 @@ public sealed class TemplateService
     private readonly TemplateRepository _repository;
     private readonly FileStorageService _fileStorage;
     private readonly TemplateParser _parser;
+    private readonly TemplateAiParser _aiParser;
     private readonly ILogger<TemplateService> _logger;
 
     public TemplateService(
         TemplateRepository repository,
         FileStorageService fileStorage,
         TemplateParser parser,
+        TemplateAiParser aiParser,
         ILogger<TemplateService> logger)
     {
         _repository = repository;
         _fileStorage = fileStorage;
         _parser = parser;
+        _aiParser = aiParser;
         _logger = logger;
     }
 
     /// <summary>
     /// 上传并解析模板
     /// </summary>
-    public async Task<(bool Success, string? TemplateId, TemplateParseResult? ParseResult)> UploadTemplateAsync(
+    public async Task<(bool Success, string? TemplateId, TemplateParseResult? ParseResult, TemplateAiVerification AiVerification)> UploadTemplateAsync(
         IFormFile file,
         string templateName,
-        string? description = null)
+        string? description = null,
+        bool aiVerify = false)
     {
+        var aiVerification = new TemplateAiVerification
+        {
+            Enabled = aiVerify,
+            AiAvailable = false,
+            FieldDiffCount = 0,
+            TableDiffCount = 0,
+            ComparisonLevel = aiVerify ? "degraded" : "disabled"
+        };
+
         try
         {
             // 1. 验证文件
             if (file.Length == 0 || !file.FileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase))
             {
                 _logger.LogWarning("无效的文件格式: {FileName}", file.FileName);
-                return (false, null, null);
+                return (false, null, null, aiVerification);
             }
 
             // 2. 生成文件名并保存文件
@@ -49,14 +62,50 @@ public sealed class TemplateService
             var fileName = $"{templateId}_{file.FileName}";
             var filePath = await _fileStorage.SaveTemplateAsync(file, fileName);
 
-            // 3. 解析模板
-            var parseResult = await _parser.ParseTemplateAsync(filePath);
+            // 3. 解析模板（aiVerify=true 时优先 AI；AI 不可用再降级本地规则）
+            TemplateParseResult parseResult;
+
+            if (aiVerify)
+            {
+                var aiResult = await _aiParser.ParseTemplateAsync(filePath);
+                if (aiResult.Available)
+                {
+                    parseResult = BuildParseResultFromAi(aiResult);
+                    foreach (var warning in aiResult.Warnings)
+                    {
+                        parseResult.Warnings.Add(warning);
+                    }
+
+                    aiVerification.AiAvailable = true;
+                    aiVerification.FieldDiffCount = 0;
+                    aiVerification.TableDiffCount = 0;
+                    aiVerification.ComparisonLevel = "ai_primary";
+                }
+                else
+                {
+                    parseResult = await _parser.ParseTemplateAsync(filePath);
+                    foreach (var warning in aiResult.Warnings)
+                    {
+                        parseResult.Warnings.Add(warning);
+                    }
+
+                    aiVerification.AiAvailable = false;
+                    aiVerification.FieldDiffCount = 0;
+                    aiVerification.TableDiffCount = 0;
+                    aiVerification.ComparisonLevel = "degraded";
+                }
+            }
+            else
+            {
+                parseResult = await _parser.ParseTemplateAsync(filePath);
+            }
+
             if (!parseResult.Success)
             {
                 _logger.LogError("模板解析失败: {FileName}", file.FileName);
                 // 删除已保存的文件
                 File.Delete(filePath);
-                return (false, null, parseResult);
+                return (false, null, parseResult, aiVerification);
             }
 
             // 4. 创建模板实体
@@ -118,17 +167,99 @@ public sealed class TemplateService
             {
                 // 删除已保存的文件
                 File.Delete(filePath);
-                return (false, null, null);
+                return (false, null, null, aiVerification);
             }
 
             _logger.LogInformation("模板上传成功: {TemplateId}, 名称: {TemplateName}", templateId, templateName);
-            return (true, templateId, parseResult);
+            return (true, templateId, parseResult, aiVerification);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "上传模板失败");
-            return (false, null, null);
+            return (false, null, null, aiVerification);
         }
+    }
+
+    private static TemplateParseResult BuildParseResultFromAi(TemplateAiParseResult aiResult)
+    {
+        var result = new TemplateParseResult
+        {
+            Success = true
+        };
+
+        var fieldSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var field in aiResult.Fields)
+        {
+            if (string.IsNullOrWhiteSpace(field) || !fieldSet.Add(field))
+            {
+                continue;
+            }
+
+            result.Fields.Add(new FieldInfo
+            {
+                Name = field,
+                Type = InferFieldType(field),
+                Required = false,
+                Position = result.Fields.Count
+            });
+        }
+
+        foreach (var table in aiResult.Tables)
+        {
+            if (string.IsNullOrWhiteSpace(table.Name))
+            {
+                continue;
+            }
+
+            var tableInfo = new TableInfo
+            {
+                Name = table.Name.Trim()
+            };
+
+            var columnSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var column in table.Columns)
+            {
+                if (string.IsNullOrWhiteSpace(column) || !columnSet.Add(column))
+                {
+                    continue;
+                }
+
+                tableInfo.Columns.Add(new TableColumnInfo
+                {
+                    Name = column,
+                    Type = InferFieldType(column),
+                    Required = false,
+                    Order = tableInfo.Columns.Count
+                });
+            }
+
+            if (tableInfo.Columns.Count > 0)
+            {
+                result.Tables.Add(tableInfo);
+            }
+        }
+
+        return result;
+    }
+
+    private static string InferFieldType(string fieldName)
+    {
+        var name = fieldName.ToLowerInvariant();
+
+        if (name.Contains("电话") || name.Contains("手机") || name.Contains("phone"))
+            return "phone";
+
+        if (name.Contains("邮箱") || name.Contains("email") || name.Contains("mail"))
+            return "email";
+
+        if (name.Contains("日期") || name.Contains("时间") || name.Contains("date"))
+            return "date";
+
+        if (name.Contains("金额") || name.Contains("数量") || name.Contains("预算") ||
+            name.Contains("number") || name.Contains("amount"))
+            return "number";
+
+        return "text";
     }
 
     /// <summary>
